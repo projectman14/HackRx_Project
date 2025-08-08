@@ -1,0 +1,37 @@
+# Core dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+python-dotenv==1.0.0
+requests==2.31.0
+
+# Google Gemini AI
+google-genai
+# Document processing
+PyPDF2==3.0.1
+supabase
+python-docx==1.1.0
+
+# Data processing
+numpy==1.24.3
+
+# Vector Database (Pinecone)
+pinecone-client==2.2.4
+
+# Additional utilities
+python-multipart==0.0.6
+aiofiles==23.2.1
+
+# Optional: For better PDF processing
+# pdfplumber==0.10.3
+# pymupdf==1.23.8
+
+# Optional: For enhanced text processing
+# nltk==3.8.1
+# spacy==3.7.2
+
+# Optional: For caching
+# redis==5.0.1
+
+# Optional: For monitoring
+# prometheus-client==0.19.0
