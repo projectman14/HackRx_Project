@@ -1,51 +1,47 @@
 # main.py
 import os
+import io
+import uuid
+import asyncio
+import logging
 import requests
 import PyPDF2
-import io
-from google import genai
-from google.genai import types
-from typing import List, Optional, Tuple
+import numpy as np
+from datetime import datetime
+from typing import List, Optional, Any, Dict
+
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import numpy as np
 from dotenv import load_dotenv
 from docx import Document as DocxDocument
 
+# LangChain imports (used for Document schema and text splitter)
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+from langchain.prompts import PromptTemplate
+
+# sklearn for cosine similarity
+from sklearn.metrics.pairwise import cosine_similarity
+
+# Google Gen AI SDK
+from google import genai
+from google.genai import types
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
-_fallback_vocab: Optional[dict] = None
-_fallback_tf_matrix: Optional[np.ndarray] = None
-
-def create_embeddings(text: str) -> tuple:
-    global _fallback_vocab, _fallback_tf_matrix  # must be first line inside function
-    
-    chunks = _chunk_text(text)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No readable text found in the document")
-
-    try:
-        embeddings = embed_texts(chunks, task_type="RETRIEVAL_DOCUMENT", output_dim=768)
-        _fallback_vocab, _fallback_tf_matrix = None, None
-        return embeddings.astype('float32'), None, chunks
-    except Exception:
-        vocab, tf = _build_fallback_tf(chunks)
-        _fallback_vocab, _fallback_tf_matrix = vocab, tf
-        return tf.astype('float32'), None, chunks
-
-
 app = FastAPI(
-    title="HackRx 6.0 - LLM Query Retrieval System",
-    description="Intelligent document processing and query system for insurance, legal, HR, and compliance domains",
-    version="1.0.0"
+    title="HackRx 6.0 - Enhanced LLM Query Retrieval System",
+    description="Advanced document processing with LangChain and Vector Database for insurance, legal, HR, and compliance domains",
+    version="2.0.0"
 )
 
-# Global Gemini client (created lazily)
-client: Optional[genai.Client] = None
-
-# CORS (allow all by default; tighten for production)
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -56,361 +52,524 @@ app.add_middleware(
 
 security = HTTPBearer()
 
-def get_gemini_client() -> genai.Client:
-    """Return a configured Gemini client (lazy init)."""
-    global client
-    if client is not None:
-        return client
+# Environment-configurable defaults
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+DEFAULT_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY not found in environment variables")
-
-    # Try to configure the genai library; fallback to passing api_key to Client constructor
-    try:
-        genai.configure(api_key=api_key)
-        client = genai.Client()
-    except Exception:
-        # Some versions allow constructing with api_key directly
-        client = genai.Client(api_key=api_key)
-    return client
-
-def embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT", output_dim: int = 768) -> np.ndarray:
-    """
-    Embed a list of texts using Gemini embedding model (gemini-embedding-001).
-    Returns a numpy array of shape (len(texts), dim) with L2-normalized rows.
-    """
-    if not texts:
-        return np.zeros((0, output_dim), dtype=np.float32)
-
-    gclient = get_gemini_client()
-    try:
-        result = gclient.models.embed_content(
-            model="gemini-embedding-001",
-            contents=texts,
-            config=types.EmbedContentConfig(
-                task_type=task_type,
-                output_dimensionality=output_dim
-            )
-        )
-    except Exception as e:
-        raise RuntimeError(f"Embedding generation failed (API): {e}")
-
-    # Robust extraction of embedding vectors
-    embeddings = []
-    try:
-        for emb_obj in result.embeddings:
-            # prefer .values attribute
-            if hasattr(emb_obj, "values"):
-                vals = emb_obj.values
-            elif isinstance(emb_obj, dict) and "values" in emb_obj:
-                vals = emb_obj["values"]
-            elif isinstance(emb_obj, dict) and "embedding" in emb_obj:
-                vals = emb_obj["embedding"]
-            else:
-                # last resort - try to stringify
-                raise RuntimeError("Unexpected embedding object format")
-            embeddings.append(np.array(vals, dtype=np.float32))
-    except Exception as e:
-        raise RuntimeError(f"Failed to parse embeddings from response: {e}")
-
-    arr = np.vstack(embeddings).astype(np.float32)
-
-    # Normalize rows for cosine similarity (Gemini returns normalized for default - but safe to normalize)
-    norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-8
-    arr = arr / norms
-    return arr
-
-def _tokenize(text: str) -> List[str]:
-    word = []
-    tokens: List[str] = []
-    for ch in text.lower():
-        if ch.isalnum():
-            word.append(ch)
-        else:
-            if word:
-                tok = ''.join(word)
-                if len(tok) > 2:
-                    tokens.append(tok)
-                word = []
-    if word:
-        tok = ''.join(word)
-        if len(tok) > 2:
-            tokens.append(tok)
-    return tokens
-
-def _build_fallback_tf(chunks: List[str]) -> Tuple[dict, np.ndarray]:
-    vocab: dict = {}
-    for chunk in chunks:
-        for tok in _tokenize(chunk):
-            if tok not in vocab:
-                vocab[tok] = len(vocab)
-    if not vocab:
-        vocab = {"document": 0}
-    tf = np.zeros((len(chunks), len(vocab)), dtype=np.float32)
-    for i, chunk in enumerate(chunks):
-        counts: dict = {}
-        for tok in _tokenize(chunk):
-            counts[tok] = counts.get(tok, 0) + 1
-        if counts:
-            maxc = max(counts.values())
-            for tok, c in counts.items():
-                j = vocab.get(tok)
-                if j is not None:
-                    tf[i, j] = c / maxc
-    norms = np.linalg.norm(tf, axis=1, keepdims=True) + 1e-8
-    tf = tf / norms
-    return vocab, tf
-
-# Global state for last processed document
-document_text: str = ""
-document_chunks: List[str] = []
-document_embeddings: Optional[np.ndarray] = None
-
-# Fallback state (declare globals at module level)
-_fallback_vocab: Optional[dict] = None
-_fallback_tf_matrix: Optional[np.ndarray] = None
 
 class QueryRequest(BaseModel):
     documents: str
     questions: List[str]
+    use_advanced_chunking: Optional[bool] = True
+    chunk_size: Optional[int] = 1000
+    chunk_overlap: Optional[int] = 200
+    retrieval_k: Optional[int] = 5
+
 
 class QueryResponse(BaseModel):
     answers: List[str]
+    document_id: str
+    processing_time: float
+    retrieval_method: str
+
+
+class DocumentInfo(BaseModel):
+    document_id: str
+    document_url: str
+    processed_at: str
+    chunk_count: int
+    embedding_method: str
+
+
+def get_gemini_client() -> genai.Client:
+    """Return a configured Gemini client (lazy init)."""
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY not found in environment variables")
+
+    # Some SDK versions support genai.configure(); others accept api_key in Client()
+    try:
+        genai.configure(api_key=api_key)
+        client = genai.Client()
+    except Exception:
+        client = genai.Client(api_key=api_key)
+    return client
+
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify API token from header against API_KEY env var."""
     api_key = os.getenv("API_KEY")
-    if credentials.credentials != api_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key"
-        )
+    if api_key is None or credentials.credentials != api_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
     return credentials.credentials
 
-def _extract_text_from_pdf_bytes(data: bytes) -> str:
-    pdf_file = io.BytesIO(data)
-    pdf_reader = PyPDF2.PdfReader(pdf_file)
-    text = ""
-    for page in pdf_reader.pages:
+
+class AdvancedDocumentProcessor:
+    """Enhanced document processor using LangChain-style splitting and Google GenAI client."""
+
+    def __init__(self, client: Optional[genai.Client] = None):
+        self.client = client or get_gemini_client()
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=2500,
+            chunk_overlap=300,
+            length_function=len,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+
+
+    def extract_text_from_url(self, url: str) -> str:
+        """Download and extract text from url/pdf/docx/text."""
         try:
-            page_text = page.extract_text() or ""
-        except Exception:
-            page_text = ""
-        if page_text:
-            text += page_text + "\n"
-    return text
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            content_type = response.headers.get('content-type', '').lower()
 
-def _extract_text_from_docx_bytes(data: bytes) -> str:
-    buf = io.BytesIO(data)
-    doc = DocxDocument(buf)
-    return "\n".join(p.text for p in doc.paragraphs)
-
-def download_and_extract_text(url: str) -> str:
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        content_type = response.headers.get('content-type', '').lower()
-
-        if url.lower().endswith('.pdf') or 'application/pdf' in content_type:
-            return _extract_text_from_pdf_bytes(response.content)
-
-        if url.lower().endswith('.docx') or 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' in content_type:
-            return _extract_text_from_docx_bytes(response.content)
-
-        return response.text
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error downloading document: {str(e)}")
-
-def _chunk_text(text: str, max_chars: int = 1000, overlap: int = 150) -> List[str]:
-    paragraphs = [p.strip() for p in text.split('\n')]
-    current = []
-    chunks: List[str] = []
-    current_len = 0
-    for p in paragraphs:
-        if not p:
-            continue
-        if current_len + len(p) + 1 <= max_chars:
-            current.append(p)
-            current_len += len(p) + 1
-        else:
-            if current:
-                chunk = "\n".join(current)
-                chunks.append(chunk)
-                if overlap > 0 and len(chunk) > overlap:
-                    tail = chunk[-overlap:]
-                    current = [tail]
-                    current_len = len(tail)
-                else:
-                    current = []
-                    current_len = 0
-            if len(p) > max_chars:
-                start = 0
-                while start < len(p):
-                    end = min(start + max_chars, len(p))
-                    chunks.append(p[start:end])
-                    start = end - overlap if overlap > 0 else end
+            if url.lower().endswith('.pdf') or 'application/pdf' in content_type:
+                return self._extract_text_from_pdf_bytes(response.content)
+            elif url.lower().endswith('.docx') or 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' in content_type:
+                return self._extract_text_from_docx_bytes(response.content)
             else:
-                current = [p]
-                current_len = len(p)
-    if current:
-        chunks.append("\n".join(current))
-    cleaned = [c.strip() for c in chunks if c and c.strip()]
-    return [c for c in cleaned if len(c) > 30]
+                return response.text
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error downloading document: {str(e)}")
 
-def create_embeddings(text: str) -> Tuple[np.ndarray, Optional[None], List[str]]:
-    """
-    Create embeddings for document chunks. This function declares fallback globals
-    at the start of the function to avoid Python 'global' placement issues.
-    """
-    global _fallback_vocab, _fallback_tf_matrix
+    def _extract_text_from_pdf_bytes(self, data: bytes) -> str:
+        pdf_file = io.BytesIO(data)
+        reader = PyPDF2.PdfReader(pdf_file)
+        text_pieces = []
+        for i, page in enumerate(reader.pages):
+            try:
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    text_pieces.append(page_text)
+            except Exception as e:
+                logger.warning(f"Failed to extract text from PDF page {i}: {e}")
+        return "\n".join(text_pieces)
 
-    chunks = _chunk_text(text)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No readable text found in the document")
+    def _extract_text_from_docx_bytes(self, data: bytes) -> str:
+        buf = io.BytesIO(data)
+        doc = DocxDocument(buf)
+        return "\n".join(p.text for p in doc.paragraphs if p.text)
 
-    # Try Gemini embeddings first
-    try:
-        embeddings = embed_texts(chunks, task_type="RETRIEVAL_DOCUMENT", output_dim=768)
-        _fallback_vocab, _fallback_tf_matrix = None, None
-        return embeddings.astype('float32'), None, chunks
-    except Exception as e:
-        # On any failure, build TF fallback
-        vocab, tf = _build_fallback_tf(chunks)
-        _fallback_vocab, _fallback_tf_matrix = vocab, tf
-        return tf.astype('float32'), None, chunks
+    def create_documents(self, text: str, source_url: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[Document]:
+        if not text or not text.strip():
+            raise HTTPException(status_code=400, detail="No readable text found in the document")
 
-def retrieve_relevant_context(question: str, top_k: int = 3) -> str:
-    global document_embeddings, document_chunks, _fallback_vocab, _fallback_tf_matrix
+        # update splitter params
+        self.text_splitter.chunk_size = chunk_size
+        self.text_splitter.chunk_overlap = chunk_overlap
 
-    if document_embeddings is None or not document_chunks:
-        return ""
+        texts = self.text_splitter.split_text(text)
+        documents: List[Document] = []
+        for i, t in enumerate(texts):
+            if len(t.strip()) > 50:
+                documents.append(
+                    Document(
+                        page_content=t,
+                        metadata={
+                            "source": source_url,
+                            "chunk_id": i,
+                            "document_type": self._detect_document_type(source_url),
+                            "timestamp": datetime.now().isoformat()
+                        }
+                    )
+                )
+        return documents
 
-    # If we have gemini embeddings, embed the query and compute cosine sims
-    if _fallback_vocab is None:
+    def _detect_document_type(self, url: str) -> str:
+        u = url.lower()
+        if '.pdf' in u:
+            return 'pdf'
+        if '.docx' in u:
+            return 'docx'
+        if '.txt' in u:
+            return 'text'
+        return 'unknown'
+
+
+class VectorStoreManager:
+    """In-memory vector store with batched + throttled Gemini embeddings."""
+
+    def __init__(self, client: genai.Client):
+        self.client = client
+        self.stores: Dict[str, Dict[str, Any]] = {}
+
+    async def create_vector_store(self, documents: List[Document], document_id: str, method: str = "in-memory") -> Dict:
+        texts = [d.page_content for d in documents]
+        if not texts:
+            raise ValueError("No texts to embed")
+
+        embeddings = []
+        batch_size = 90  # Safe limit under Gemini's 100 max
+        delay = 1.0      # seconds between batches
+        model_name = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+
+        logger.info(f"Embedding {len(texts)} chunks for document {document_id} using {model_name}")
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            tries = 0
+            while tries < 3:
+                try:
+                    res = self.client.models.batch_embed_contents(
+                        model=model_name,
+                        requests=[{"content": t} for t in batch]
+                    )
+                    batch_embeddings = [np.array(e.values) for e in res.embeddings]
+                    embeddings.extend(batch_embeddings)
+                    break  # success → break retry loop
+                except Exception as e:
+                    tries += 1
+                    logger.error(f"Embedding batch {i//batch_size+1} failed (attempt {tries}): {e}")
+                    if tries < 3:
+                        await asyncio.sleep(2 ** tries)  # exponential backoff
+                    else:
+                        raise
+
+            if i + batch_size < len(texts):
+                await asyncio.sleep(delay)  # throttle to avoid 429s
+
+        # Normalize
+        normed = []
+        for emb in embeddings:
+            norm = np.linalg.norm(emb)
+            normed.append(emb if norm == 0 else emb / norm)
+
+        self.stores[document_id] = {
+            "documents": documents,
+            "embeddings": np.vstack(normed)
+        }
+        logger.info(f"Created vector store '{document_id}' with {len(documents)} chunks (batched & throttled)")
+        return self.stores[document_id]
+
+
+
+    def get_retriever(self, document_id: str, k: int = 5):
+        store = self.stores.get(document_id)
+        if not store:
+            raise ValueError(f"No vector store found for document_id: {document_id}")
+        return GenAICosineRetriever(store, self.client, k)
+
+
+class GenAICosineRetriever:
+    """Retriever using cosine similarity on stored embeddings."""
+
+    def __init__(self, store: Dict[str, Any], client: genai.Client, k: int):
+        self.documents: List[Document] = store["documents"]
+        self.embeddings = store["embeddings"]
+        self.client = client
+        self.k = k
+
+    def get_relevant_documents(self, query: str) -> List[Document]:
+        if self.embeddings is None or self.embeddings.size == 0:
+            logger.warning("Embeddings not available, falling back to text-based retrieval.")
+            fr = FallbackRetriever({"documents": self.documents}, k=self.k)
+            return fr.get_relevant_documents(query)
+
+        # normal embedding retrieval
+        res = self.client.models.embed_content(
+            model=os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
+            contents=[query],
+            config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY")
+        )
+        q_emb = np.array(res.embeddings[0].values)
+        norm = np.linalg.norm(q_emb)
+        if norm != 0:
+            q_emb = q_emb / norm
+        scores = (self.embeddings @ q_emb).tolist()
+        top_idx = np.argsort(scores)[::-1][: self.k]
+        return [self.documents[int(i)] for i in top_idx]
+
+async def embed_in_batches(self, texts, model="models/text-embedding-004", batch_size=50, delay=1):
+    all_embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
         try:
-            q_emb = embed_texts([question], task_type="RETRIEVAL_QUERY", output_dim=document_embeddings.shape[1])
-            sims = np.dot(document_embeddings, q_emb[0])
-        except Exception:
-            # Build fallback and retry
-            _fallback_vocab, _fallback_tf_matrix = _build_fallback_tf(document_chunks)
-            return retrieve_relevant_context(question, top_k)
-    else:
-        # fallback TF-based cosine similarity
-        vec = np.zeros((len(_fallback_vocab),), dtype=np.float32)
-        counts: dict = {}
-        for tok in _tokenize(question):
-            counts[tok] = counts.get(tok, 0) + 1
-        if counts:
-            maxc = max(counts.values())
-            for tok, c in counts.items():
-                j = _fallback_vocab.get(tok)
-                if j is not None:
-                    vec[j] = c / maxc
-        vec = vec / (np.linalg.norm(vec) + 1e-8)
-        sims = _fallback_tf_matrix @ vec
+            res = self.client.models.batch_embed_contents(
+                model=model,
+                requests=[{"content": t} for t in batch]
+            )
+            all_embeddings.extend([r.values for r in res.embeddings])
+        except Exception as e:
+            logger.error(f"Embedding batch failed: {e}")
+        await asyncio.sleep(delay)  # avoid 429s
+    return all_embeddings
 
-    top_k = min(top_k, len(sims))
-    top_indices = np.argsort(-sims)[:top_k]
-    selected = [document_chunks[i] for i in top_indices]
-    return "\n\n".join(selected)
 
-def generate_answer(question: str, context: str) -> str:
-    """
-    Try to generate an answer using Gemini text model. If generation fails, fall back
-    to extracting a short snippet from context.
-    """
-    try:
-        prompt = f"""
-You are an expert in analyzing insurance, legal, HR, and compliance documents.
-Answer the question accurately and concisely based only on the provided context.
+class FallbackRetriever:
+    """Simple word overlap fallback retriever."""
 
-Context:
+    def __init__(self, store: Dict[str, Any], k: int = 5):
+        self.documents = store.get("documents", [])
+        self.k = k
+
+    def get_relevant_documents(self, query: str) -> List[Document]:
+        q_words = set(query.lower().split())
+        scored = []
+        for d in self.documents:
+            words = set(d.page_content.lower().split())
+            overlap = len(q_words.intersection(words))
+            if overlap > 0:
+                score = overlap / max(1, len(q_words.union(words)))
+                scored.append((score, d))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [d for _, d in scored[: self.k]]
+
+
+class GeminiLLM:
+    """Small wrapper around genai client for synchronous generation."""
+
+    def __init__(self, client: genai.Client, model: str = DEFAULT_GEMINI_MODEL):
+        self.client = client
+        self.model = model
+
+    def generate(self, prompt: str, max_output_tokens: int = 1024) -> str:
+        try:
+            resp = self.client.models.generate_content(
+                model=os.getenv("GEMINI_MODEL", self.model),
+                contents=prompt,
+                # further params can be added via 'temperature', 'max_output_tokens', etc.
+            )
+            # Newer SDK: resp may have `.text`, `.candidates`, or `.output` structure.
+            # We attempt to extract meaningful textual content robustly.
+            if hasattr(resp, "text") and resp.text:
+                return resp.text.strip()
+            if hasattr(resp, "outputs") and resp.outputs:
+                # outputs may be a list of generation objects with 'content' or 'text'
+                out = resp.outputs[0]
+                if hasattr(out, "content"):
+                    return getattr(out, "content").strip()
+                if isinstance(out, dict) and out.get("text"):
+                    return out["text"].strip()
+            if hasattr(resp, "candidates") and resp.candidates:
+                return resp.candidates[0].content.strip()
+            # As fallback stringify
+            return str(resp).strip()
+        except Exception as e:
+            logger.error(f"Gemini generation failed: {e}")
+            raise
+
+
+class AdvancedQAChain:
+    """Advanced QA chain using custom prompt + Gemini LLM wrapper."""
+
+    def __init__(self, llm: Optional[GeminiLLM]):
+        self.llm = llm
+        self.qa_prompt = self._create_qa_prompt()
+
+    def _create_qa_prompt(self) -> PromptTemplate:
+        template = """
+You are an expert analyst specializing in insurance, legal, HR, and compliance documents. 
+Your task is to provide accurate, detailed, and contextually relevant answers based solely on the provided context.
+
+Context Information:
 {context}
 
 Question: {question}
 
 Instructions:
-- If the answer is not in the context, reply exactly: "The information is not available in the provided document."
-- Keep answers concise (1-3 sentences), cite terms from the context when possible.
+1. Base your answer ONLY on the information provided in the context above
+2. If the information is not available in the context, respond with: "The requested information is not available in the provided document."
+3. For legal and compliance topics, be precise and cite specific sections when possible
+4. For insurance documents, focus on coverage details, exclusions, and policy terms
+5. For HR documents, emphasize policies, procedures, and employee rights/responsibilities
+6. Keep answers comprehensive yet concise (2-5 sentences)
+7. Use professional terminology appropriate to the domain
+8. If there are multiple relevant pieces of information, organize them clearly
 
 Answer:
 """
-        gclient = get_gemini_client()
-        # Use model generate_content. This is defensive: we try to extract text in a few common places.
-        response = gclient.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-        text = ""
-        if hasattr(response, "text"):
-            text = (response.text or "").strip()
-        elif isinstance(response, dict):
-            # Try to parse dictionary-shaped responses conservatively
-            output = response.get("output") or response.get("outputs") or []
-            if output:
-                first = output[0]
-                # nested content array in some libs
-                if isinstance(first, dict):
-                    content = first.get("content") or first.get("text") or []
-                    if isinstance(content, list) and content:
-                        text = content[0].get("text", "") if isinstance(content[0], dict) else str(content[0])
-                    else:
-                        text = first.get("text", "") or ""
-        if text:
-            return text
-        raise RuntimeError("Empty response from generation API")
-    except Exception:
-        # Fallback: extract up to 3 sentence-like spans from context
-        if not context:
-            return "The information is not available in the provided document."
-        spans = []
-        cur = []
-        for ch in context:
-            cur.append(ch)
-            if ch in '.!?\n' and len(''.join(cur).strip()) > 40:
-                spans.append(''.join(cur).strip())
-                cur = []
-            if len(spans) >= 3:
-                break
-        snippet = ' '.join(spans) if spans else context[:350]
-        return snippet.strip()
+        return PromptTemplate(template=template, input_variables=["context", "question"])
+
+    def run(self, question: str, documents: List[Document]) -> str:
+        if not documents or not question:
+            return "The requested information is not available in the provided document."
+
+        context = "\n\n".join([d.page_content for d in documents])
+        formatted_prompt = self.qa_prompt.format(context=context, question=question)
+
+        if not self.llm:
+            # fallback simple extraction
+            return self._fallback_answer(question, documents)
+
+        try:
+            answer = self.llm.generate(formatted_prompt)
+            # The generation may contain extra whitespace; trim
+            return answer.strip()
+        except Exception as e:
+            logger.error(f"QA generation failed: {e}")
+            return self._fallback_answer(question, documents)
+
+    def _fallback_answer(self, question: str, documents: List[Document]) -> str:
+        # simple keyword based extraction
+        q_words = set(question.lower().split())
+        best_doc, best_score = None, 0
+        for d in documents:
+            words = set(d.page_content.lower().split())
+            score = len(q_words.intersection(words))
+            if score > best_score:
+                best_score = score
+                best_doc = d
+        if not best_doc:
+            return "The requested information is not available in the provided document."
+        sentences = best_doc.page_content.split(". ")
+        return ". ".join(sentences[:3]) + ('.' if len(sentences) > 3 else '')
+
+
+# ---- Global instances ----
+core_client = get_gemini_client()
+doc_processor = AdvancedDocumentProcessor(client=core_client)
+vector_manager = VectorStoreManager(core_client)
+gemini_llm = GeminiLLM(core_client, model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
+qa_chain = AdvancedQAChain(gemini_llm)
+
+# in-memory registry for processed documents
+document_store: Dict[str, Dict[str, Any]] = {}
+
 
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def process_query(request: QueryRequest, token: str = Depends(verify_token)):
-    global document_text, document_embeddings, document_chunks
+    start_time = datetime.now()
+    document_id = str(uuid.uuid4())
+
     try:
-        # Download and process the document
-        print(f"[INFO] Downloading document: {request.documents}")
-        document_text = download_and_extract_text(request.documents)
+        logger.info(f"Processing document URL: {request.documents}")
 
-        # Build embeddings (or fallback TF)
-        print("[INFO] Creating embeddings / fallback TF")
-        document_embeddings, _, document_chunks = create_embeddings(document_text)
+        # Extract text
+        document_text = doc_processor.extract_text_from_url(request.documents)
 
-        # Process questions
+        # Chunk / create LangChain documents
+        documents = doc_processor.create_documents(
+            text=document_text,
+            source_url=request.documents,
+            chunk_size=request.chunk_size or 1000,
+            chunk_overlap=request.chunk_overlap or 200
+        )
+
+        if not documents:
+            raise HTTPException(status_code=400, detail="No valid document chunks created")
+
+        # Create vector store (in-memory)
+        try:
+            vector_store = await vector_manager.create_vector_store(
+                documents=documents,
+                document_id=document_id,
+                method="in-memory"
+            )
+        except Exception as e:
+            logger.error(f"Embedding failed for {document_id}: {e}")
+            vector_manager.stores[document_id] = {
+                "documents": documents,
+                "embeddings": None
+            }
+            retriever = FallbackRetriever(vector_manager.stores[document_id], k=request.retrieval_k or 5)
+        else:
+            retriever = vector_manager.get_retriever(document_id, k=request.retrieval_k or 5)
+
+
+        # Save document info
+        document_store[document_id] = {
+            "url": request.documents,
+            "processed_at": datetime.now().isoformat(),
+            "chunk_count": len(documents),
+            "embedding_method": "google-generative-ai"
+        }
+
+        # Retrieval + QA
+        retriever = vector_manager.get_retriever(document_id, k=request.retrieval_k or 5)
         answers = []
-        for i, question in enumerate(request.questions):
-            print(f"[INFO] Question {i+1}: {question}")
-            context = retrieve_relevant_context(question)
-            answer = generate_answer(question, context)
-            answers.append(answer)
+        for q in request.questions:
+            try:
+                relevant_docs = retriever.get_relevant_documents(q)
+                ans = qa_chain.run(q, relevant_docs)
+                answers.append(ans)
+            except Exception as e:
+                logger.error(f"Error answering question '{q}': {e}")
+                answers.append("Error processing this question. Please try again.")
 
-        return QueryResponse(answers=answers)
+        processing_time = (datetime.now() - start_time).total_seconds()
+        return QueryResponse(
+            answers=answers,
+            document_id=document_id,
+            processing_time=processing_time,
+            retrieval_method="in-memory-cosine"
+        )
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+        logger.exception(f"Error in process_query: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/document/{document_id}", response_model=DocumentInfo)
+async def get_document_info(document_id: str, token: str = Depends(verify_token)):
+    if document_id not in document_store:
+        raise HTTPException(status_code=404, detail="Document not found")
+    info = document_store[document_id]
+    return DocumentInfo(
+        document_id=document_id,
+        document_url=info["url"],
+        processed_at=info["processed_at"],
+        chunk_count=info["chunk_count"],
+        embedding_method=info.get("embedding_method", "unknown")
+    )
+
+
+@app.delete("/document/{document_id}")
+async def delete_document(document_id: str, token: str = Depends(verify_token)):
+    if document_id in document_store:
+        del document_store[document_id]
+    if document_id in vector_manager.stores:
+        del vector_manager.stores[document_id]
+    return {"message": f"Document {document_id} deleted successfully"}
+
+
+@app.get("/documents")
+async def list_documents(token: str = Depends(verify_token)):
+    return {
+        "documents": [
+            {
+                "document_id": doc_id,
+                "url": info["url"],
+                "processed_at": info["processed_at"],
+                "chunk_count": info["chunk_count"]
+            } for doc_id, info in document_store.items()
+        ],
+        "total_count": len(document_store)
+    }
+
 
 @app.get("/")
 async def root():
     return {
-        "message": "HackRx 6.0 - LLM Query Retrieval System",
+        "message": "HackRx 6.0 - Enhanced LLM Query Retrieval System",
+        "version": "2.0.0",
         "status": "running",
+        "features": [
+            "LangChain integration",
+            "Vector database support (FAISS/Chroma optional)",
+            "Advanced document chunking",
+            "Domain-specific QA prompts",
+            "Fallback mechanisms"
+        ],
         "endpoint": "/hackrx/run"
     }
 
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "components": {
+            "gemini_client": core_client is not None,
+            "vector_stores_active": len(vector_manager.stores),
+            "documents_processed": len(document_store)
+        },
+        "timestamp": datetime.now().isoformat()
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

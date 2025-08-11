@@ -1,9 +1,34 @@
-fastapi>=0.116.0
-uvicorn>=0.35.0
+# Core dependencies from original
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-dotenv==1.0.0
+pydantic
+packaging
+requests
+PyPDF2==3.0.1
+python-docx==1.1.0
+numpy==1.25.2
 google-genai
-requests>=2.31.0
-python-dotenv>=1.0.0
-PyPDF2>=3.0.1
-python-docx>=1.1.0
-numpy>=2.0.0
-pydantic>=2.5.0
+
+# LangChain dependencies
+langchain
+langchain-community
+langchain-core
+langchain-google-genai==0.0.6
+
+# Vector Database dependencies
+chromadb==0.4.18
+faiss-cpu==1.7.4  # Use faiss-gpu if you have GPU support
+
+# Additional utility dependencies
+tiktoken==0.5.2  # For token counting
+sentence-transformers==2.2.2  # Alternative embeddings
+transformers==4.36.2  # For HuggingFace models if needed
+
+# Optional: Advanced vector databases (uncomment if needed)
+# pinecone-client==2.2.4  # For Pinecone
+# weaviate-client==3.25.3  # For Weaviate
+# qdrant-client==1.7.0  # For Qdrant
+
+# Monitoring and logging
+python-multipart==0.0.6  # For file uploads if needed in future
