@@ -27,7 +27,6 @@ faiss-cpu==1.7.4  # Use faiss-gpu if you have GPU support
 
 # Additional utility dependencies
 tiktoken==0.5.2  # For token counting
-sentence-transformers==2.2.2  # Alternative embeddings
 transformers==4.36.2  # For HuggingFace models if needed
 
 # Optional: Advanced vector databases (uncomment if needed)
